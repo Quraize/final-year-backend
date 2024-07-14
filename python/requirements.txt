@@ -1,0 +1,6 @@
+torch
+flask
+aksharamukha
+pysentimiento
+soundfile
+omegaconf
