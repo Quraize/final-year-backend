@@ -2,8 +2,7 @@ import axios from "axios";
 import { errorHandler } from '../../../utils/error.handler.js';
 
 const getSpeech = async (req, res, next) => {
-  console.time('Request Processing Time');
-
+  console.log("req started.")
   const { input_text, language, speaker } = req.body;
 
   const languageConfig = {
@@ -31,6 +30,7 @@ const getSpeech = async (req, res, next) => {
       indic_lang: config.indic_lang || ''
     });
 
+    console.log("req sent to python" );
     
     if(response.data.status !== 200){
       next(errorHandler(503, "The server is unable to handle the server at the moment."));
@@ -39,6 +39,9 @@ const getSpeech = async (req, res, next) => {
 
     const audioBase64 = response.data.audio;
     res.json({ audio: audioBase64 });
+
+    console.log("res sent");
+    console.log("------")
   } catch (error) {
     next(error);
   }
