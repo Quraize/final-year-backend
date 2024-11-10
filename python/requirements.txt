@@ -4,3 +4,5 @@ aksharamukha
 pysentimiento
 soundfile
 omegaconf
+diffusers
+git+https://github.com/huggingface/transformers.git

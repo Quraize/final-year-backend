@@ -6,8 +6,16 @@ from aksharamukha import transliterate
 import base64
 from threading import Lock
 from pysentimiento import create_analyzer
+from transformers import pipeline, MBartForConditionalGeneration, MBart50TokenizerFast, T5Tokenizer, T5ForConditionalGeneration
+from language_mapping import LANGUAGE_NAME_MAPPING, LANGUAGE_CODES
+from functools import lru_cache
+
 
 app = Flask(__name__)
+
+# Detect if CUDA is available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 # Dictionary to cache loaded TTS model and some constants to create Speech
 models_cache = {}
@@ -21,7 +29,24 @@ put_yo = True
 analyzer_cache = {}
 analyzer_lock = Lock()
 
-#Function to Load model and caching that model for TTS
+# Dictionary to cache language detection model
+language_detection_cache = {}
+language_detection_lock = Lock()
+
+# Dictionary to cache summarizer model
+summarizer_cache = {}
+summarizer_lock = Lock()
+
+# Dictionary to cache translation model
+translation_model_cache = {}
+translation_model_lock = Lock()
+
+keywords_model_cache = {}
+keywords_model_lock = Lock()
+
+##FUNCTION TO LOAD THE MODELS IN THE CACHE
+
+# Function to Load model and caching that model for TTS
 def load_model_TTS(language, model_id):
     key = f"{language}_{model_id}"
     if key not in models_cache:
@@ -32,7 +57,7 @@ def load_model_TTS(language, model_id):
                     model='silero_tts',
                     language=language,
                     speaker=model_id)
-                model.to(torch.device('cpu'))
+                model.to(device)  # Move the model to the GPU if available
                 models_cache[key] = model
     return models_cache[key]
 
@@ -43,6 +68,94 @@ def get_analyzer(task, language):
             if key not in analyzer_cache:   # Double-checked locking
                 analyzer_cache[key] = create_analyzer(task=task, lang=language)
     return analyzer_cache[key]
+
+def load_language_detection_model():
+    key = "language_detection"
+    if key not in language_detection_cache:
+        with language_detection_lock:
+            if key not in language_detection_cache:  # Double-checked locking
+                model_ckpt = "papluca/xlm-roberta-base-language-detection"
+                language_detection_cache[key] = pipeline(
+                    "text-classification",
+                    model=model_ckpt,
+                    device=0 if device.type == "cuda" else -1,
+                    batch_size=1  # Smaller batch size to manage memory
+                )
+    return language_detection_cache[key]
+
+def load_summarizer_model():
+    key = "summarization"
+    if key not in summarizer_cache:
+        with summarizer_lock:
+            if key not in summarizer_cache:  # Double-checked locking
+                summarizer_cache[key] = pipeline(
+                    "summarization",
+                    model="facebook/bart-large-cnn",
+                    device=0 if device.type == "cuda" else -1,
+                    batch_size=1  # Smaller batch size for memory efficiency
+                )
+    return summarizer_cache[key]
+
+def generate_tts_audio(model, input_text, speaker):
+    audio = model.apply_tts(
+        text=input_text,
+        speaker=speaker,
+        sample_rate=sample_rate,
+        put_accent=put_accent,
+        put_yo=put_yo
+    )
+    return audio, sample_rate
+
+
+# Load and cache the translation model
+def load_translation_model():
+    key = "translation"
+    if key not in translation_model_cache:
+        with translation_model_lock:
+            if key not in translation_model_cache:
+                model = MBartForConditionalGeneration.from_pretrained("facebook/mbart-large-50-many-to-many-mmt").to(device)
+                tokenizer = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50-many-to-many-mmt")
+                translation_model_cache[key] = (model, tokenizer)
+    return translation_model_cache[key]
+
+# Translation function
+def translate_text(article, src_lang, tgt_lang):
+    model, tokenizer = load_translation_model()
+    tokenizer.src_lang = src_lang
+
+    # Encode the text and move tensors to CPU
+    encoded_article = tokenizer(article, return_tensors="pt").to(device)
+    
+    # Temporarily move model to GPU if available
+    if torch.cuda.is_available():
+        model.to("cuda")
+        encoded_article = encoded_article.to("cuda")
+
+    # Generate the translation
+    generated_tokens = model.generate(
+        **encoded_article,
+        forced_bos_token_id=tokenizer.lang_code_to_id[tgt_lang]
+    )
+
+    # Move model back to CPU to save GPU memory
+    model.to("cpu")
+
+    # Decode the generated tokens
+    translation = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+    return translation[0]
+
+
+def load_keywords_model():
+    key = "keywords"
+    if key not in keywords_model_cache:
+        with keywords_model_lock:
+            if key not in keywords_model_cache:  # Double-checked locking
+                model = T5ForConditionalGeneration.from_pretrained("Voicelab/vlt5-base-keywords").to(device)
+                tokenizer = T5Tokenizer.from_pretrained("Voicelab/vlt5-base-keywords", legacy=False)
+                keywords_model_cache[key] = (model, tokenizer)
+    return keywords_model_cache[key]
+
+##API ROUTES
 
 @app.route('/generate-audio', methods=['POST'])
 def generate_audio():
@@ -57,12 +170,29 @@ def generate_audio():
     
     if language == 'indic':
         if indic_lang == "hindi":
-            input_text= transliterate.process('Devanagari', 'ISO', input_text)
+            input_text = transliterate.process('Devanagari', 'ISO', input_text)
         elif indic_lang == "urdu":
             input_text = transliterate.process('Urdu', 'Latn', input_text)
 
-    audio, _ = generate_tts_audio(model, input_text, speaker)
+    audio = None  # Initialize `audio` to ensure it has a default value
     
+    try:
+        audio, _ = generate_tts_audio(model, input_text, speaker)
+        
+        # Free GPU memory after audio generation
+        model.to('cpu')  # Move model back to CPU
+        torch.cuda.empty_cache()  # Clear GPU memory
+
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            torch.cuda.empty_cache()
+            return jsonify({'status': 500, 'error': 'Out of memory. Try again with a smaller input or use CPU.'}), 500
+        else:
+            return jsonify({'status': 500, 'error': f'An error occurred: {str(e)}'}), 500
+    
+    if audio is None:
+        return jsonify({'status': 500, 'error': 'Failed to generate audio due to an unexpected error.'}), 500
+
     # Save to a memory buffer
     buffer = io.BytesIO()
     sf.write(buffer, audio, sample_rate, format='WAV')
@@ -76,13 +206,7 @@ def generate_audio():
         'audio': audio_base64
     })
 
-def generate_tts_audio(model, input_text, speaker):
-    audio = model.apply_tts(text=input_text,
-                            speaker=speaker,
-                            sample_rate=sample_rate,
-                            put_accent=put_accent,
-                            put_yo=put_yo)
-    return audio, sample_rate
+
 
 @app.route('/sentiment-analysis', methods=['POST'])
 def sentiment_analysis():
@@ -98,14 +222,165 @@ def sentiment_analysis():
     elif type == "hate_speech":
         analyzer = get_analyzer("hate_speech", language)
 
-    result = analyzer.predict(text)
+    try:
+        result = analyzer.predict(text)
+        
+        # Free GPU memory after prediction
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # Clear GPU memory
+
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            torch.cuda.empty_cache()
+            return jsonify({'status': 500, 'error': 'Out of memory. Try again later or use smaller inputs.'}), 500
     
     return jsonify({
         'status': 200,
         'result': {
-            'output':result.output,
-            'probas':result.probas
+            'output': result.output,
+            'probas': result.probas
         }
+    })
+
+@lru_cache(maxsize=500)  # Adjust cache size as needed
+def detect_language_code(text):
+    # Load or run your language detection model
+    # Assuming you have a function `load_language_detection_model()`
+    pipe = load_language_detection_model()
+    result = pipe(text, top_k=1, truncation=True)
+    return result[0]['label'], round(result[0]['score'], 4)
+
+@app.route('/language-detection', methods=['POST'])
+def language_detection():
+    data = request.json
+    texts = data.get("texts", [])
+
+    if not texts or not isinstance(texts, list):
+        return jsonify({'status': 400, 'error': 'Invalid input. Provide a list of texts.'}), 400
+
+    response = []
+    for text in texts:
+        # Cache language detection calls to avoid redundant processing
+        predicted_language_code, score = detect_language_code(text)
+        
+        # Use full language name if in our predefined mappings
+        predicted_language_full_name = LANGUAGE_NAME_MAPPING.get(predicted_language_code, predicted_language_code)
+
+        response.append({
+            'text': text,
+            'predicted_language': predicted_language_full_name,  # Use the full name
+            'score': score
+        })
+
+    return jsonify({
+        'status': 200,
+        'results': response
+    })
+
+
+@app.route('/summarize', methods=['POST'])
+def summarize():
+    data = request.json
+    article = data.get("article", "")
+    max_length = int(data.get("max_length", 30))
+    min_length = int(data.get("min_length", 30))
+
+    if not article:
+        return jsonify({'status': 400, 'error': 'Invalid input. Provide the text to summarize.'}), 400
+
+    summarizer = load_summarizer_model()
+
+    try:
+        summary = summarizer(article, max_length=max_length, min_length=min_length, do_sample=False)
+        
+        # Free GPU memory after summarization
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # Clear GPU memory
+
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            torch.cuda.empty_cache()
+            return jsonify({'status': 500, 'error': 'Out of memory. Try again with shorter text or use CPU.'}), 500
+
+    return jsonify({
+        'status': 200,
+        'summary': summary[0]['summary_text']
+    })
+
+
+@app.route('/translate', methods=['POST'])
+def translate():
+    data = request.json
+    article = data.get("article", "")
+    src_lang = data.get("src_lang", "")
+    tgt_lang = data.get("tgt_lang", "")
+
+    # Validate input
+    if not article or not src_lang or not tgt_lang:
+        return jsonify({'status': 400, 'error': 'Invalid input. Provide article, src_lang, and tgt_lang.'}), 400
+
+    try:
+        # Translate the text
+        translation = translate_text(article, src_lang, tgt_lang)
+        
+        # Free GPU memory after translation if CUDA is available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            torch.cuda.empty_cache()
+            return jsonify({'status': 500, 'error': 'Out of memory. Try again with shorter text or use CPU.'}), 500
+        else:
+            return jsonify({'status': 500, 'error': f'An error occurred: {str(e)}'}), 500
+
+    return jsonify({
+        'status': 200,
+        'translation': translation
+    })
+
+@app.route('/generate-keywords', methods=['POST'])
+def generate_keywords():
+    data = request.json
+    article = data.get("article", "")
+    max_length = data.get("max_length", 50)
+    task_prefix = "Keywords: "
+
+    if not article:
+        return jsonify({'status': 400, 'error': 'Invalid input. Provide the text to generate keywords.'}), 400
+
+    model, tokenizer = load_keywords_model()
+
+    try:
+        input_sequence = task_prefix + article
+        input_ids = tokenizer(
+            input_sequence, return_tensors="pt", truncation=True,
+            max_length=tokenizer.model_max_length
+        ).input_ids.to(device)
+
+        output = model.generate(
+            input_ids,
+            max_length=max_length,
+            no_repeat_ngram_size=3,
+            num_beams=4
+        )
+
+        predicted = tokenizer.decode(output[0], skip_special_tokens=True)
+
+        # Free GPU memory after generation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            torch.cuda.empty_cache()
+            return jsonify({'status': 500, 'error': 'Out of memory. Try again with shorter text or use CPU.'}), 500
+        else:
+            return jsonify({'status': 500, 'error': f'An error occurred: {str(e)}'}), 500
+
+    return jsonify({
+        'status': 200,
+        'keywords': predicted
     })
 
 if __name__ == '__main__':
