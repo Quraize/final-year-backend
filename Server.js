@@ -13,6 +13,10 @@ import translateRouter from './Routes/Func/Translation/translation.post.route.js
 import SummarizeRouter from './Routes/Func/Summarize/Summarize.post.route.js';
 import keywordsRouter from './Routes/Func/keywords/keywords.route.post.js';
 
+//authentication
+import signUpRouter from './Routes/Func/authentication/signup.post.route.js';
+import signInRouter from './Routes/Func/authentication/signin.post.route.js';
+
 //environment variable configurations "secrets"
 dotenv.config();
 const port = process.env.PORT || 8080;
@@ -43,6 +47,9 @@ app.use('/analysis', languageDetectionRouter);
 app.use('/evaluation', SummarizeRouter);
 app.use('/evaluation', keywordsRouter);
 
+//authentication
+app.use('/user', signUpRouter);
+app.use('/user', signInRouter);
 
 //middleware
 app.use((err, req, res, next) => {

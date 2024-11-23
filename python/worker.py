@@ -9,9 +9,15 @@ from pysentimiento import create_analyzer
 from transformers import pipeline, MBartForConditionalGeneration, MBart50TokenizerFast, T5Tokenizer, T5ForConditionalGeneration
 from language_mapping import LANGUAGE_NAME_MAPPING, LANGUAGE_CODES
 from functools import lru_cache
+import base64
+import threading
+import time
+from diffusers import StableDiffusionPipeline
+from flask_socketio import SocketIO, emit
 
 
 app = Flask(__name__)
+socketio = SocketIO(app, async_mode="threading")  # Enable asynchronous communication
 
 # Detect if CUDA is available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -43,6 +49,14 @@ translation_model_lock = Lock()
 
 keywords_model_cache = {}
 keywords_model_lock = Lock()
+
+# Cache Stable Diffusion model for reuse
+stable_diffusion_cache = {}
+stable_diffusion_lock = threading.Lock()
+
+# Dictionary to store ongoing task results
+task_results = {}
+task_results_lock = threading.Lock()
 
 ##FUNCTION TO LOAD THE MODELS IN THE CACHE
 
@@ -154,6 +168,66 @@ def load_keywords_model():
                 tokenizer = T5Tokenizer.from_pretrained("Voicelab/vlt5-base-keywords", legacy=False)
                 keywords_model_cache[key] = (model, tokenizer)
     return keywords_model_cache[key]
+
+def load_stable_diffusion_model():
+    key = "stable_diffusion"
+    if key not in stable_diffusion_cache:
+        with stable_diffusion_lock:
+            if key not in stable_diffusion_cache:  # Double-checked locking
+                model = StableDiffusionPipeline.from_pretrained(
+                    "stabilityai/stable-diffusion-2-1-base", torch_dtype=torch.float16
+                )
+                model.enable_model_cpu_offload()  # Enable CPU offloading for limited GPU VRAM
+                model.safety_checker = None  # Disable safety checker
+                stable_diffusion_cache[key] = model
+    return stable_diffusion_cache[key]
+
+def generate_image_task(task_id, prompt, num_inference_steps):
+    """
+    Background task to generate an image using Stable Diffusion.
+    """
+    try:
+        model = load_stable_diffusion_model()
+        start_time = time.time()
+        
+        # Generate the image
+        image = model(prompt, num_inference_steps=num_inference_steps).images[0]
+        end_time = time.time()
+
+        # Convert the image to base64 format
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        buffer.seek(0)
+        image_base64 = base64.b64encode(buffer.read()).decode("utf-8")
+
+        # Save the result
+        with task_results_lock:
+            task_results[task_id] = {
+                'status': 'completed',
+                'image': image_base64,
+                'execution_time': f"{end_time - start_time:.2f} seconds"
+            }
+
+        # Notify the client
+        socketio.emit(f"task_update_{task_id}", {
+            'status': 'completed',
+            'image': image_base64,
+            'execution_time': f"{end_time - start_time:.2f} seconds"
+        })
+
+    except Exception as e:
+        with task_results_lock:
+            task_results[task_id] = {
+                'status': 'failed',
+                'error': str(e)
+            }
+        
+        # Notify the client of failure
+        socketio.emit(f"task_update_{task_id}", {
+            'status': 'failed',
+            'error': str(e)
+        })
+
 
 ##API ROUTES
 
@@ -383,5 +457,44 @@ def generate_keywords():
         'keywords': predicted
     })
 
+@app.route('/generate-image', methods=['POST'])
+def generate_image():
+    """
+    API endpoint to start an image generation task.
+    """
+    data = request.json
+    prompt = data.get("prompt", "An artistic painting of a futuristic cityscape")
+    num_inference_steps = int(data.get("num_inference_steps", 50))
+
+    if not prompt:
+        return jsonify({'status': 400, 'error': 'Invalid input. Provide a valid text prompt.'}), 400
+
+    # Generate a unique task ID
+    task_id = f"task_{int(time.time() * 1000)}"
+
+    # Mark the task as in progress
+    with task_results_lock:
+        task_results[task_id] = {'status': 'in_progress'}
+
+    # Start the background task
+    threading.Thread(target=generate_image_task, args=(task_id, prompt, num_inference_steps)).start()
+
+    return jsonify({
+        'status': 200,
+        'task_id': task_id,
+        'message': 'Image generation task started. Use WebSocket or polling to get updates.'
+    })
+
+@app.route('/task-status/<task_id>', methods=['GET'])
+def task_status(task_id):
+    """
+    API endpoint to check the status of an image generation task.
+    """
+    with task_results_lock:
+        if task_id not in task_results:
+            return jsonify({'status': 404, 'error': 'Task not found'}), 404
+        
+        return jsonify(task_results[task_id])
+
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
